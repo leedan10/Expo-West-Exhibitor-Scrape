@@ -34,11 +34,25 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
-      # ── 4. Install Playwright browsers ────────────────────────────────────────
+      # ── 4. Fix Ubuntu 24.04 libasound2 package rename ────────────────────────
+      #    Ubuntu 24.04 renamed libasound2 → libasound2t64; install the alias
+      #    so Playwright's --with-deps does not fail on the old package name.
+      - name: Install Ubuntu 24.04 Playwright system prerequisites
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libasound2t64 \
+            libgbm1 \
+            libnss3 \
+            libxss1 \
+            libxtst6 \
+            xvfb
+
+      # ── 5. Install Playwright browsers ────────────────────────────────────────
       - name: Install Playwright Chromium
         run: playwright install chromium --with-deps
 
-      # ── 5. Run the scraper ────────────────────────────────────────────────────
+      # ── 6. Run the scraper ────────────────────────────────────────────────────
       - name: Run scraper
         run: |
           ARGS=""
@@ -50,7 +64,7 @@ jobs:
           fi
           python scraper.py $ARGS
 
-      # ── 6. Upload output Excel files as artifact ──────────────────────────────
+      # ── 7. Upload output Excel files as artifact ──────────────────────────────
       - name: Upload output files
         if: always()   # upload even if scraper exited with an error (partial data)
         uses: actions/upload-artifact@v4
@@ -60,7 +74,7 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
-      # ── 7. Upload logs + screenshots on failure ────────────────────────────────
+      # ── 8. Upload logs + screenshots on failure ────────────────────────────────
       - name: Upload debug artifacts
         if: failure()
         uses: actions/upload-artifact@v4
