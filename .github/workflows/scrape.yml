@@ -1,0 +1,74 @@
+name: Expo West 2026 Exhibitor Scraper
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Max exhibitors to scrape (0 = all)"
+        required: false
+        default: "0"
+      reset:
+        description: "Clear checkpoints and start fresh (true/false)"
+        required: false
+        default: "false"
+
+jobs:
+  scrape:
+    name: Scrape Exhibitor Data
+    runs-on: ubuntu-latest
+    timeout-minutes: 180  # 3 hours max (large show ~2,000+ exhibitors)
+
+    steps:
+      # ── 1. Checkout repo ─────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python setup ───────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # ── 3. Install Python dependencies ────────────────────────────────────────
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      # ── 4. Install Playwright browsers ────────────────────────────────────────
+      - name: Install Playwright Chromium
+        run: playwright install chromium --with-deps
+
+      # ── 5. Run the scraper ────────────────────────────────────────────────────
+      - name: Run scraper
+        run: |
+          ARGS=""
+          if [ "${{ github.event.inputs.reset }}" = "true" ]; then
+            ARGS="$ARGS --reset"
+          fi
+          if [ "${{ github.event.inputs.limit }}" != "0" ]; then
+            ARGS="$ARGS --limit ${{ github.event.inputs.limit }}"
+          fi
+          python scraper.py $ARGS
+
+      # ── 6. Upload output Excel files as artifact ──────────────────────────────
+      - name: Upload output files
+        if: always()   # upload even if scraper exited with an error (partial data)
+        uses: actions/upload-artifact@v4
+        with:
+          name: expo-west-2026-data
+          path: output/
+          retention-days: 30
+          if-no-files-found: warn
+
+      # ── 7. Upload logs + screenshots on failure ────────────────────────────────
+      - name: Upload debug artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraper-debug-${{ github.run_number }}
+          path: |
+            logs/
+            screenshots/
+            checkpoints/
+          retention-days: 7
+          if-no-files-found: ignore
