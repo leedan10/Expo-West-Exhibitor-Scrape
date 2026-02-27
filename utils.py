@@ -119,19 +119,19 @@ def make_retry_decorator(max_attempts: int = config.MAX_RETRIES):
 
 async def wait_for_exhibitor_cards(page, timeout_ms: int = config.AJAX_WAIT_TIMEOUT_MS) -> bool:
     """
-    Wait for at least one exhibitor card (linking to /co/) to appear in the DOM.
-    Returns True if cards appeared before timeout, False otherwise.
+    Wait for at least one exhibitor card / link to appear in the DOM.
+    Tries all selectors in config.SELECTORS["exhibitor_cards"].
+    Returns True if any card appeared before timeout, False otherwise.
     """
-    try:
-        await page.wait_for_selector(
-            config.SELECTORS["exhibitor_cards"],
-            timeout=timeout_ms,
-            state="attached",
-        )
-        return True
-    except Exception:
-        logger.warning("Timed out waiting for exhibitor cards to appear.")
-        return False
+    selectors = [s.strip() for s in config.SELECTORS["exhibitor_cards"].split(",")]
+    for sel in selectors:
+        try:
+            await page.wait_for_selector(sel, timeout=timeout_ms, state="attached")
+            return True
+        except Exception:
+            pass
+    logger.warning("Timed out waiting for exhibitor cards to appear.")
+    return False
 
 
 async def wait_for_network_idle(page, timeout_ms: int = 8_000) -> None:
