@@ -27,6 +27,7 @@ EXHIBITOR_COLUMNS = [
     ("information",         "Description / Information"),
     ("product_categories",  "Product Categories"),
     ("country",             "Country"),
+    ("state",               "State"),
     ("company_url",         "Company URL"),
     # Per-platform social media columns
     ("facebook_url",        "Facebook"),
