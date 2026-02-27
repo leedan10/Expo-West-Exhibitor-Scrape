@@ -75,32 +75,61 @@ async def discover_exhibitor_links(
     progress: ProgressTracker,
 ) -> list[dict]:
     """
-    Navigate to the exhibitor listing page, wait for AJAX cards, paginate
-    through all pages, and return the full list of exhibitor link dicts.
+    Navigate the exhibitor listing page, handle pagination, and return all
+    exhibitor link dicts. Uses BOTH AJAX interception and DOM parsing together
+    so that no pages are skipped.
 
     Strategy:
-      1. Intercept XHR/fetch calls to capture JSON from WordPress admin-ajax.php.
-         If successful, parse ALL exhibitors from the JSON response directly.
-      2. Fallback: detect pagination via DOM, iterate pages clicking Next.
+      - Intercept all JSON responses throughout the entire pagination loop
+        to capture any AJAX-loaded slugs on each page.
+      - Also parse the DOM on each page for /co/ links.
+      - Paginate until:
+          a) We've visited all detected pages (from DOM pagination), OR
+          b) 3 consecutive pages yield zero new links (handles undetected pagination
+             and infinite-scroll sites that respond to ?page=N).
     """
     logger.info("=== Phase 1: Discovering exhibitor links ===")
-    all_links: list[dict] = []
-    intercepted_slugs: list[str] = []
 
-    # ── Set up network interception for AJAX JSON ──────────────────────────────
+    all_links: list[dict] = []
+    all_keys: set[str] = set()          # dedup set — slug or full URL
+    ajax_buffer: list[str] = []         # AJAX-captured slugs, drained each page
+
+    # ── Keep AJAX interception active for ALL page navigations ────────────────
     async def handle_response(response):
-        url = response.url
-        if "admin-ajax.php" in url or "exhibitors" in url.lower():
-            try:
-                content_type = response.headers.get("content-type", "")
-                if "json" in content_type:
-                    body = await response.json()
-                    _parse_ajax_json(body, intercepted_slugs)
-            except Exception:
-                pass  # Not every XHR is the one we want
+        try:
+            content_type = response.headers.get("content-type", "")
+            if "json" in content_type:
+                body = await response.json()
+                _parse_ajax_json(body, ajax_buffer)
+        except Exception:
+            pass
 
     page.on("response", handle_response)
 
+    def harvest(html: str) -> int:
+        """Add new links from current DOM HTML + drain the AJAX buffer."""
+        new_count = 0
+        # DOM links
+        for link in extractors.extract_exhibitor_links(html):
+            key = link.get("slug") or link["url"]
+            if key not in all_keys:
+                all_keys.add(key)
+                all_links.append(link)
+                new_count += 1
+        # AJAX-intercepted slugs
+        for slug in ajax_buffer:
+            if slug not in all_keys:
+                all_keys.add(slug)
+                all_links.append({
+                    "url": f"{config.BASE_URL}/co/{slug}",
+                    "slug": slug,
+                    "booth_id": None,
+                })
+                new_count += 1
+        ajax_buffer.clear()
+        return new_count
+
+    # ── Page 1 ─────────────────────────────────────────────────────────────────
     logger.info(f"Navigating to {config.EXHIBITOR_LIST_URL}")
     ok = await safe_navigate(page, config.EXHIBITOR_LIST_URL)
     if not ok:
@@ -109,62 +138,70 @@ async def discover_exhibitor_links(
 
     cards_found = await wait_for_exhibitor_cards(page)
     if not cards_found:
-        logger.warning("No exhibitor cards detected after page load — the page may require interaction.")
+        logger.warning("No exhibitor cards detected — page may require interaction.")
         await screenshot_on_error(page, "listing_no_cards")
 
     await wait_for_network_idle(page)
-
-    # If AJAX interception caught slugs, use those
-    if intercepted_slugs:
-        logger.info(f"AJAX interception captured {len(intercepted_slugs)} slugs.")
-        all_links = [
-            {"url": f"{config.BASE_URL}/co/{slug}", "slug": slug, "booth_id": None}
-            for slug in intercepted_slugs
-        ]
-        links_cache.set(all_links)
-        return all_links
-
-    # ── DOM-based pagination fallback ──────────────────────────────────────────
-    logger.info("AJAX interception did not capture data; falling back to DOM pagination.")
-
-    # Detect total pages
     html = await page.content()
+
+    # Detect total pages from DOM (may be 1 if pagination is hidden/AJAX-only)
     total_pages = extractors.extract_total_pages(html)
-    logger.info(f"Detected {total_pages} total page(s) in the listing.")
+    logger.info(f"DOM pagination detected {total_pages} page(s).")
     progress.update(total_pages=total_pages, phase="listing")
 
-    # Page 1 links
-    page_links = extractors.extract_exhibitor_links(html)
-    all_links.extend(page_links)
-    logger.info(f"Page 1: found {len(page_links)} links (running total: {len(all_links)})")
+    n = harvest(html)
+    logger.info(f"Page 1: +{n} new links (total so far: {len(all_links)})")
 
-    # Pages 2..N
-    for page_num in range(2, total_pages + 1):
+    # ── Pages 2 … N (and beyond if links keep appearing) ──────────────────────
+    consecutive_empty = 0
+    page_num = 2
+
+    while True:
+        # Stop when we've exhausted detected pages AND hit 3 empty probes
+        if page_num > total_pages and consecutive_empty >= 3:
+            logger.info(
+                f"No new links for 3 consecutive pages past detected total "
+                f"({total_pages}). Discovery complete."
+            )
+            break
+
         progress.set("current_page", page_num)
         await _navigate_to_listing_page(page, page_num)
+
         cards_found = await wait_for_exhibitor_cards(page)
         if not cards_found:
-            logger.warning(f"No cards found on page {page_num}; skipping.")
+            logger.warning(f"No cards found on page {page_num}.")
             await screenshot_on_error(page, f"listing_page_{page_num}")
+            consecutive_empty += 1
+            page_num += 1
             continue
+
         await wait_for_network_idle(page)
         html = await page.content()
-        page_links = extractors.extract_exhibitor_links(html)
-        all_links.extend(page_links)
-        logger.info(f"Page {page_num}: +{len(page_links)} links (running total: {len(all_links)})")
+
+        n = harvest(html)
+        if n == 0:
+            consecutive_empty += 1
+            logger.info(
+                f"Page {page_num}: no new links "
+                f"(empty streak: {consecutive_empty})"
+            )
+        else:
+            consecutive_empty = 0
+            # If we're finding links beyond the DOM-detected total, extend the scan
+            if page_num >= total_pages:
+                total_pages = page_num + 1
+            logger.info(
+                f"Page {page_num}: +{n} new links "
+                f"(total so far: {len(all_links)})"
+            )
+
+        page_num += 1
         await random_delay()
 
-    # Deduplicate (preserve order)
-    seen: set[str] = set()
-    deduped: list[dict] = []
-    for link in all_links:
-        key = link["url"]
-        if key not in seen:
-            seen.add(key)
-            deduped.append(link)
-    logger.info(f"Phase 1 complete: {len(deduped)} unique exhibitors discovered.")
-    links_cache.set(deduped)
-    return deduped
+    logger.info(f"Phase 1 complete: {len(all_links)} unique exhibitors discovered.")
+    links_cache.set(all_links)
+    return all_links
 
 
 def _parse_ajax_json(body, result_slugs: list[str]) -> None:
@@ -214,6 +251,39 @@ async def _navigate_to_listing_page(page: Page, page_num: int) -> None:
     await safe_navigate(page, url)
 
 
+# ── Team-tab helper ───────────────────────────────────────────────────────────
+
+async def _get_team_tab_html(page: Page) -> str:
+    """
+    Try to click the Team / People / Staff tab on an exhibitor detail page so
+    that its content is rendered into the DOM.  Returns the full page HTML
+    after the attempt (whether or not the tab was found).
+    """
+    team_tab_selectors = [
+        "a[href*='_team']",
+        "a[href*='_people']",
+        "a[href*='_staff']",
+        "[data-tab='team']",
+        "[data-target*='team']",
+        "[href='#team']",
+        "a:has-text('Team')",
+        "a:has-text('People')",
+        "a:has-text('Staff')",
+        "li:has-text('Team') a",
+        "li:has-text('People') a",
+    ]
+    for sel in team_tab_selectors:
+        try:
+            tab = page.locator(sel).first
+            if await tab.count() > 0:
+                await tab.click()
+                await asyncio.sleep(1.5)   # let AJAX render
+                break
+        except Exception:
+            pass
+    return await page.content()
+
+
 # ── Phase 2: Scrape detail pages ───────────────────────────────────────────────
 
 async def scrape_detail_pages(
@@ -260,11 +330,12 @@ async def scrape_detail_pages(
             # Store a partial record so we don't retry endlessly
             record = {"exhibitor_name": key, "source_url": url, "_error": str(exc)}
 
-        # Extract team members from the same page HTML (already loaded)
+        # Extract team members — try clicking the team/people tab first so
+        # that its content is rendered before we grab the HTML.
         exhibitor_name = record.get("exhibitor_name", key)
         try:
-            html = await page.content()
-            team_members = extractors.extract_team_members(html, exhibitor_name)
+            team_html = await _get_team_tab_html(page)
+            team_members = extractors.extract_team_members(team_html, exhibitor_name)
             if team_members:
                 team_cache.extend(team_members)
                 logger.debug(f"  → {len(team_members)} team member(s) found")

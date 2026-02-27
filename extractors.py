@@ -3,14 +3,15 @@ HTML parsing and data extraction functions.
 All functions accept rendered HTML strings and return clean Python dicts/lists.
 No browser dependencies here — pure BeautifulSoup.
 
-Confirmed selectors from live analysis of expowest26.smallworldlabs.com (Feb 2026):
+SmallWorld Labs exhibitor page structure (expowest26.smallworldlabs.com):
   - Cards link to /co/{slug}
-  - Company name: #organizations_profile_0_0 h4
-  - Booth:        <a href="...MapItBooth=3312...">Booth #3312</a>
-  - About tab:    [id$='_about']  → description paragraphs + categories line
-  - Contact tab:  [id$='_contact'] → address block + website link
-  - Hall:         NOT publicly exposed (left blank)
-  - Social links: best-effort from about + contact tab anchors
+  - Company name: #organizations_profile_0_0 h4  (fallback: first h1/h2)
+  - Booth:        <a href="...MapItBooth=3312...">
+  - Hall:         "Hall X" text near booth info or in profile header
+  - About tab:    element whose id ends with '_about'   → description + categories
+  - Contact tab:  element whose id ends with '_contact' → address, website, social
+  - Social links: scanned from both tabs + whole page fallback (per-platform)
+  - Team members: tab with id ending '_team' / '_people' / '_staff' (may be login-gated)
 """
 import logging
 import re
@@ -21,6 +22,22 @@ from bs4 import BeautifulSoup
 import config
 
 logger = logging.getLogger("expowest_scraper.extractors")
+
+# ── Social platform domain mappings ───────────────────────────────────────────
+
+_PLATFORM_DOMAINS: dict[str, list[str]] = {
+    "facebook":  ["facebook.com"],
+    "twitter":   ["twitter.com", "x.com"],
+    "linkedin":  ["linkedin.com"],
+    "instagram": ["instagram.com"],
+    "youtube":   ["youtube.com", "youtu.be"],
+    "tiktok":    ["tiktok.com"],
+    "pinterest": ["pinterest.com"],
+}
+
+_ALL_SOCIAL_DOMAINS: set[str] = {
+    d for domains in _PLATFORM_DOMAINS.values() for d in domains
+}
 
 
 # ── Exhibitor list page ────────────────────────────────────────────────────────
@@ -88,13 +105,54 @@ def extract_total_pages(html: str) -> int:
             pass
 
     # Strategy 2: numeric text in pagination anchors
-    for el in soup.select(".pagination a, .page-numbers, [class*='paginator'] a"):
+    for el in soup.select(
+        ".pagination a, .page-numbers, [class*='paginator'] a, "
+        "[class*='pagination'] a, .pager a"
+    ):
         text = el.get_text(strip=True)
         if text.isdigit():
             max_page = max(max_page, int(text))
 
+    # Strategy 3: "Page X of Y" or "Showing X-Y of Z" style text
+    page_text = soup.get_text(" ")
+    m = re.search(r"page\s+\d+\s+of\s+(\d+)", page_text, re.I)
+    if m:
+        max_page = max(max_page, int(m.group(1)))
+
     logger.debug(f"Detected {max_page} total pages")
     return max_page
+
+
+# ── Internal tab-finder helper ─────────────────────────────────────────────────
+
+def _find_tab(soup: BeautifulSoup, selectors: list[str]):
+    """Try each CSS selector in order; return the first matching element or None."""
+    for sel in selectors:
+        try:
+            el = soup.select_one(sel)
+            if el:
+                return el
+        except Exception:
+            pass
+    return None
+
+
+# ── Social media classification ────────────────────────────────────────────────
+
+def _classify_social_url(href: str) -> str | None:
+    """Return the platform key ('facebook', 'twitter', …) or None."""
+    try:
+        domain = urlparse(href).netloc.lower().lstrip("www.")
+    except Exception:
+        return None
+    for platform, domains in _PLATFORM_DOMAINS.items():
+        if any(d in domain for d in domains):
+            return platform
+    return None
+
+
+def _is_social_url(href: str) -> bool:
+    return _classify_social_url(href) is not None
 
 
 # ── Exhibitor detail page ──────────────────────────────────────────────────────
@@ -110,20 +168,28 @@ def extract_exhibitor_detail(html: str, source_url: str) -> dict:
     soup = BeautifulSoup(html, "lxml")
 
     result = {
-        "exhibitor_name": "",
-        "booth_number": "",
-        "information": "",
+        "exhibitor_name":   "",
+        "booth_number":     "",
+        "hall":             "",
+        "information":      "",
         "product_categories": "",
-        "hall": "",          # not publicly available on SmallWorld Labs
-        "country": "",
-        "company_url": "",
-        "social_media_links": "",
-        "source_url": source_url,
+        "country":          "",
+        "company_url":      "",
+        # Per-platform social media columns
+        "facebook_url":     "",
+        "twitter_url":      "",
+        "linkedin_url":     "",
+        "instagram_url":    "",
+        "youtube_url":      "",
+        "tiktok_url":       "",
+        "pinterest_url":    "",
+        "source_url":       source_url,
     }
 
     try:
         _parse_name(soup, result)
         _parse_booth(soup, result)
+        _parse_hall(soup, result)
         _parse_about_tab(soup, result)
         _parse_contact_tab(soup, result)
     except Exception as exc:
@@ -141,7 +207,20 @@ def _parse_name(soup: BeautifulSoup, result: dict) -> None:
             result["exhibitor_name"] = h4.get_text(strip=True)
             return
 
-    # Fallback: first <h1> or <h2> on page
+    # Fallback 1: any element with class containing 'org-name', 'company-name', etc.
+    for sel in [
+        "[class*='org-name']", "[class*='company-name']",
+        "[class*='organization-name']", "[class*='profile-name']",
+        "[class*='exhibitor-name']",
+    ]:
+        el = soup.select_one(sel)
+        if el:
+            text = el.get_text(strip=True)
+            if text:
+                result["exhibitor_name"] = text
+                return
+
+    # Fallback 2: first <h1> or <h2> on page
     for tag in ("h1", "h2"):
         el = soup.select_one(tag)
         if el:
@@ -166,29 +245,125 @@ def _parse_booth(soup: BeautifulSoup, result: dict) -> None:
     result["booth_number"] = ", ".join(booths)
 
 
+def _parse_hall(soup: BeautifulSoup, result: dict) -> None:
+    """
+    Try to extract hall / pavilion / building info.
+    Checks booth anchor text/siblings, profile header, and then the wider page.
+    """
+    hall_pattern = re.compile(
+        r'\b(Hall|Pavilion|Building|Level|Section)\s*[:\-]?\s*([A-Z0-9]+)',
+        re.IGNORECASE,
+    )
+
+    # 1. Check booth-related anchors and their parent context
+    for anchor in soup.find_all("a", href=re.compile(r"MapItBooth=")):
+        # Check link text
+        text = anchor.get_text(strip=True)
+        m = hall_pattern.search(text)
+        if m:
+            result["hall"] = m.group(0).strip()
+            return
+        # Check the surrounding container (parent, grandparent)
+        for el in [anchor.parent, anchor.parent.parent if anchor.parent else None]:
+            if el:
+                container_text = el.get_text(separator=" ", strip=True)
+                m = hall_pattern.search(container_text)
+                if m:
+                    result["hall"] = m.group(0).strip()
+                    return
+
+    # 2. Elements whose class/id contains 'booth', 'hall', 'location', 'floor'
+    for el in soup.find_all(
+        True,
+        attrs={"class": re.compile(r"booth|hall|location|floor", re.I)},
+    ):
+        text = el.get_text(separator=" ", strip=True)
+        m = hall_pattern.search(text)
+        if m:
+            result["hall"] = m.group(0).strip()
+            return
+
+    for el in soup.find_all(
+        True,
+        attrs={"id": re.compile(r"booth|hall|location|floor", re.I)},
+    ):
+        text = el.get_text(separator=" ", strip=True)
+        m = hall_pattern.search(text)
+        if m:
+            result["hall"] = m.group(0).strip()
+            return
+
+    # 3. Scan first 4 000 chars of page text (profile header area)
+    page_text = soup.get_text(separator=" ")[:4000]
+    m = hall_pattern.search(page_text)
+    if m:
+        result["hall"] = m.group(0).strip()
+
+
 def _parse_about_tab(soup: BeautifulSoup, result: dict) -> None:
-    about = soup.select_one("[id$='_about']")
+    """
+    Extract description text and product categories from the About tab.
+
+    Tries <p> tags first; if those are empty falls back to any block-level
+    element that contains meaningful text (handles sites that use <div> markup).
+    Also uses a heading-based search for explicit 'Product Categories' labels.
+    """
+    about = _find_tab(soup, [
+        "[id$='_about']",
+        "[id*='about'][class*='tab']",
+        "[id*='about'][class*='pane']",
+        "#tab-about",
+        "#about",
+        "[data-tab='about']",
+        "[aria-label*='about' i]",
+    ])
     if not about:
         return
 
-    paragraphs = about.find_all("p")
+    # ── Collect candidate text blocks ─────────────────────────────────────────
+    def _is_leaf_block(el) -> bool:
+        """True if element has no block-level children (avoids double-counting)."""
+        block_tags = {"p", "div", "li", "ul", "ol", "section", "article", "blockquote"}
+        return not any(
+            getattr(child, "name", None) in block_tags
+            for child in el.children
+        )
+
+    text_blocks: list[str] = []
+
+    # Pass 1: <p> tags
+    for p in about.find_all("p"):
+        text = p.get_text(separator=" ", strip=True)
+        if text:
+            text_blocks.append(text)
+
+    # Pass 2: if no <p> results, try leaf <div> / <span> / <li>
+    if not text_blocks:
+        for tag in about.find_all(["div", "span", "li", "td"]):
+            if _is_leaf_block(tag):
+                text = tag.get_text(separator=" ", strip=True)
+                if len(text) > 20:
+                    text_blocks.append(text)
+
+    # Pass 3: last resort — split raw text into lines
+    if not text_blocks:
+        raw = about.get_text(separator="\n", strip=True)
+        text_blocks = [ln.strip() for ln in raw.split("\n") if len(ln.strip()) > 20]
+
+    # ── Separate description from product categories ──────────────────────────
     description_parts: list[str] = []
     categories_line = ""
 
-    for p in paragraphs:
-        text = p.get_text(separator=" ", strip=True)
-        if not text:
-            continue
+    for text in text_blocks:
         words = text.split()
         comma_count = text.count(",")
-        # Heuristic: a categories line has many commas relative to word count
-        is_categories = (
+        is_category_line = (
             comma_count >= 2
-            and comma_count / max(len(words), 1) > 0.25
-            and len(text) < 600
+            and comma_count / max(len(words), 1) > 0.20
+            and len(text) < 800
             and not categories_line
         )
-        if is_categories:
+        if is_category_line:
             categories_line = text
         else:
             description_parts.append(text)
@@ -196,65 +371,123 @@ def _parse_about_tab(soup: BeautifulSoup, result: dict) -> None:
     result["information"] = " ".join(description_parts).strip()
     result["product_categories"] = categories_line
 
-    # If heuristic missed, look for a label element near the category data
+    # ── Explicit label-based category search (overrides heuristic if found) ───
     if not categories_line:
-        for label in about.find_all(string=re.compile(r"categor", re.I)):
-            parent = label.parent
-            if parent:
-                sibling = parent.find_next_sibling()
-                if sibling:
-                    result["product_categories"] = sibling.get_text(strip=True)
+        label_patterns = re.compile(
+            r"product\s*categor|categor|product\s*line|product\s*type",
+            re.IGNORECASE,
+        )
+        for label_node in about.find_all(string=label_patterns):
+            parent = label_node.parent
+            if not parent:
+                continue
+            # Try next sibling of parent
+            sib = parent.find_next_sibling()
+            if sib:
+                text = sib.get_text(strip=True)
+                if text:
+                    result["product_categories"] = text
                     break
+            # Try: parent contains both label + value (strip the label prefix)
+            full_text = parent.get_text(strip=True)
+            stripped = label_patterns.sub("", full_text).lstrip(":- ").strip()
+            if stripped and len(stripped) > 3:
+                result["product_categories"] = stripped
+                break
 
 
 def _parse_contact_tab(soup: BeautifulSoup, result: dict) -> None:
-    contact = soup.select_one("[id$='_contact']")
-    if not contact:
-        return
+    """
+    Extract company URL, per-platform social links, and country from the
+    Contact tab (and/or About tab).  If no contact tab is found, falls back
+    to scanning the whole page so data is never silently dropped.
+    """
+    contact = _find_tab(soup, [
+        "[id$='_contact']",
+        "[id*='contact'][class*='tab']",
+        "[id*='contact'][class*='pane']",
+        "#tab-contact",
+        "#contact",
+        "[data-tab='contact']",
+        "[aria-label*='contact' i]",
+    ])
 
-    social_links: list[str] = []
+    # If contact tab not found, scan the entire page body as fallback
+    scan_root = contact if contact else soup
 
-    for anchor in contact.find_all("a", href=True):
+    # ── Scan for social links + company URL ───────────────────────────────────
+    _collect_links(scan_root, result)
+
+    # Also check About tab for social links (some sites put them there)
+    about = _find_tab(soup, [
+        "[id$='_about']", "[id*='about'][class*='tab']",
+        "[id*='about'][class*='pane']", "#about",
+    ])
+    if about and about is not scan_root:
+        _collect_links(about, result, social_only=True)
+
+    # Whole-page fallback: scan entire body if still missing key fields
+    missing_social = any(
+        not result[f"{p}_url"]
+        for p in _PLATFORM_DOMAINS
+    )
+    if missing_social or not result["company_url"]:
+        _collect_links(soup, result)
+
+    # ── Country from address block ────────────────────────────────────────────
+    address_text = _extract_address_text(contact if contact else soup)
+    if address_text:
+        result["country"] = _guess_country(address_text)
+
+
+def _collect_links(
+    container: BeautifulSoup,
+    result: dict,
+    social_only: bool = False,
+) -> None:
+    """
+    Walk <a href> elements in container.
+    - Assign social URLs to their per-platform fields (first occurrence wins).
+    - Assign the first non-excluded, non-social external URL to company_url.
+
+    If social_only=True, skip the company_url assignment.
+    """
+    for anchor in container.find_all("a", href=True):
         href: str = anchor["href"]
         if not href.startswith("http"):
             continue
 
-        parsed = urlparse(href)
-        domain = parsed.netloc.lower().lstrip("www.")
-
-        # Social media
-        if any(s in domain for s in config.SOCIAL_DOMAINS):
-            if href not in social_links:
-                social_links.append(href)
+        platform = _classify_social_url(href)
+        if platform:
+            field = f"{platform}_url"
+            if not result.get(field):
+                result[field] = href
             continue
 
-        # Skip internal / event platform links
+        if social_only:
+            continue
+
+        parsed = urlparse(href)
+        domain = parsed.netloc.lower().lstrip("www.")
         if any(excl in domain for excl in config.EXCLUDED_DOMAINS):
             continue
 
-        # First external link = company website
         if not result["company_url"]:
-            result["company_url"] = href
-
-    # Also scan the about tab for social links
-    about = soup.select_one("[id$='_about']")
-    if about:
-        for anchor in about.find_all("a", href=True):
-            href = anchor["href"]
-            if not href.startswith("http"):
-                continue
-            parsed = urlparse(href)
-            domain = parsed.netloc.lower().lstrip("www.")
-            if any(s in domain for s in config.SOCIAL_DOMAINS):
-                if href not in social_links:
-                    social_links.append(href)
-
-    result["social_media_links"] = " | ".join(social_links)
-
-    # Country: look for an address block; country is typically the last non-empty line
-    address_text = _extract_address_text(contact)
-    if address_text:
-        result["country"] = _guess_country(address_text)
+            # Prefer links labelled "website" / "homepage" over generic first link
+            anchor_text = anchor.get_text(strip=True).lower()
+            parent_text = (
+                anchor.parent.get_text(strip=True).lower()
+                if anchor.parent else ""
+            )
+            is_labelled = any(
+                kw in anchor_text + " " + parent_text
+                for kw in ("website", "web site", "homepage", "home page", "visit us")
+            )
+            if is_labelled:
+                result["company_url"] = href
+            elif not result["company_url"]:
+                # Store as candidate but keep scanning for a labelled one
+                result["company_url"] = href
 
 
 def _extract_address_text(container: BeautifulSoup) -> str:
@@ -265,7 +498,10 @@ def _extract_address_text(container: BeautifulSoup) -> str:
         return addr.get_text(separator="\n", strip=True)
 
     # Try common classes
-    for sel in (".contact-info", ".address", "[class*='address']", "[class*='location']"):
+    for sel in (
+        ".contact-info", ".address", "[class*='address']",
+        "[class*='location']", "[class*='contact-details']",
+    ):
         el = container.select_one(sel)
         if el:
             return el.get_text(separator="\n", strip=True)
@@ -283,17 +519,15 @@ def _guess_country(address_text: str) -> str:
     if not lines:
         return ""
 
-    # The last line often contains country or ZIP + country
     last_line = lines[-1]
 
     # If last line looks like a US ZIP or ZIP+4, try second-to-last
     if re.match(r"^\d{5}(-\d{4})?$", last_line) and len(lines) >= 2:
         last_line = lines[-2]
 
-    # Strip trailing punctuation
     country = last_line.rstrip(".,;")
 
-    # Simple sanity check: if it's very long it's probably not just a country name
+    # Sanity check: if very long it's probably not just a country name
     if len(country) > 60:
         return ""
 
@@ -305,37 +539,78 @@ def _guess_country(address_text: str) -> str:
 def extract_team_members(html: str, exhibitor_name: str) -> list[dict]:
     """
     Attempt to extract team member records from a public exhibitor page.
-    Returns a list of dicts: [{exhibitor_name, team_member_name, job_title}].
+    Returns [{exhibitor_name, team_member_name, job_title}].
     Returns an empty list gracefully if team data is login-gated or absent.
+
+    Caller should click the team tab before getting the HTML so that AJAX
+    content is rendered.
     """
     soup = BeautifulSoup(html, "lxml")
     results: list[dict] = []
 
-    # Try various selectors used by SmallWorld Labs / WordPress member plugins
     card_selectors = [
+        # SmallWorld Labs-specific
+        ".swl-member",
+        ".swl-person",
+        "[class*='swl-member']",
+        "[class*='member-row']",
+        "[class*='person-row']",
+        ".org-member",
+        "[class*='org-member']",
+        # Team tab content
+        "[id$='_team'] [class*='member']",
+        "[id$='_team'] li",
+        "[id*='team'] [class*='member']",
+        "[id*='team'] li",
+        "[id$='_people'] li",
+        "[id$='_staff'] li",
+        "[id*='people'] li",
+        "[id*='staff'] li",
+        # Profile / people cards
         ".member-card",
         ".staff-item",
         ".people-card",
+        ".team-member",
+        ".contact-card",
+        ".profile-card",
+        ".person-card",
+        # WordPress team plugins
+        ".team-member-entry",
+        ".staff-member",
+        "[class*='team-member']",
+        # Generic list items in member/team/people/staff sections
         "[class*='member-list'] li",
         "[class*='team-members'] li",
         "[class*='staff-list'] li",
-        ".org-member",
+        "[class*='people-list'] li",
+        # Table-based layouts
+        ".members-table tr:not(:first-child)",
+        "table[class*='team'] tr:not(:first-child)",
+    ]
+
+    name_selectors = [
+        ".member-name", ".staff-name", ".person-name", ".contact-name",
+        ".swl-member-name", "[class*='member-name']", "[class*='person-name']",
+        "h4", "h5", "h6", "strong", ".name", "[class*='name']",
+    ]
+    title_selectors = [
+        ".member-title", ".job-title", ".staff-role", ".person-title",
+        ".swl-member-title", "[class*='job-title']", "[class*='member-title']",
+        ".role", ".position", "em", "small", "span[class*='title']",
+        "[class*='title']", "[class*='role']", "[class*='position']",
     ]
 
     for selector in card_selectors:
-        cards = soup.select(selector)
+        try:
+            cards = soup.select(selector)
+        except Exception:
+            continue
         if not cards:
             continue
 
         for card in cards:
-            name = _extract_text_by_selectors(card, [
-                ".member-name", ".staff-name", "h5", "h4",
-                "[class*='name']", "strong",
-            ])
-            title = _extract_text_by_selectors(card, [
-                ".member-title", ".job-title", ".staff-role",
-                "[class*='title']", "[class*='role']", "em", "small",
-            ])
+            name = _extract_text_by_selectors(card, name_selectors)
+            title = _extract_text_by_selectors(card, title_selectors)
             if name:
                 results.append({
                     "exhibitor_name": exhibitor_name,
@@ -344,7 +619,7 @@ def extract_team_members(html: str, exhibitor_name: str) -> list[dict]:
                 })
 
         if results:
-            break  # Found members with this selector; stop trying others
+            break   # Found members with this selector; stop trying others
 
     if not results:
         logger.debug(f"No public team members found for '{exhibitor_name}'")

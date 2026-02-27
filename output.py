@@ -23,12 +23,19 @@ logger = logging.getLogger("expowest_scraper.output")
 EXHIBITOR_COLUMNS = [
     ("exhibitor_name",      "Exhibitor Name"),
     ("booth_number",        "Booth Number"),
+    ("hall",                "Hall"),
     ("information",         "Description / Information"),
     ("product_categories",  "Product Categories"),
-    ("hall",                "Hall"),
     ("country",             "Country"),
     ("company_url",         "Company URL"),
-    ("social_media_links",  "Social Media Links"),
+    # Per-platform social media columns
+    ("facebook_url",        "Facebook"),
+    ("twitter_url",         "Twitter / X"),
+    ("linkedin_url",        "LinkedIn"),
+    ("instagram_url",       "Instagram"),
+    ("youtube_url",         "YouTube"),
+    ("tiktok_url",          "TikTok"),
+    ("pinterest_url",       "Pinterest"),
     ("source_url",          "Source URL"),
 ]
 
