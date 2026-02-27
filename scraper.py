@@ -20,9 +20,12 @@ Usage:
 """
 import argparse
 import asyncio
+import base64
 import json
 import logging
 import sys
+
+import httpx
 
 from playwright.async_api import async_playwright, Page
 
@@ -44,6 +47,112 @@ from utils import (
     wait_for_network_idle,
     safe_navigate,
 )
+
+
+# ── Swapcard GraphQL API helpers ───────────────────────────────────────────────
+
+EXHIBITOR_LIST_QUERY = """
+query GetPlannings($eventId: ID!, $first: Int!, $after: String) {
+  plannings(eventId: $eventId, type: [EXHIBITOR], first: $first, after: $after) {
+    pageInfo { hasNextPage endCursor }
+    nodes { id exhibitor { id name } }
+  }
+}
+"""
+
+
+def _parse_planning_page(body: dict) -> tuple[list, bool, "str | None"]:
+    """Parse a Swapcard plannings GraphQL response page.
+
+    Returns (nodes, has_next_page, end_cursor).
+    """
+    try:
+        plannings = (body.get("data") or {}).get("plannings") or {}
+        nodes = plannings.get("nodes") or []
+        page_info = plannings.get("pageInfo") or {}
+        has_next = bool(page_info.get("hasNextPage", False))
+        cursor = page_info.get("endCursor")
+        return nodes, has_next, cursor
+    except Exception:
+        return [], False, None
+
+
+async def _try_graphql_api() -> list[dict]:
+    """Attempt to discover all exhibitors via direct Swapcard GraphQL HTTP calls.
+
+    Returns a list of link dicts (same format as DOM-based discovery).
+    Returns [] on any error so the Playwright fallback is used instead.
+    """
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": get_random_user_agent(),
+    }
+    event_query = {
+        "query": f'{{ eventBySlug(slug: "{config.EVENT_SLUG}") {{ id }} }}'
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            # Step 1: Resolve event ID from slug
+            r = await client.post(
+                config.GRAPHQL_URL, json=event_query, headers=headers
+            )
+            data = r.json().get("data") or {}
+            event_id = (data.get("eventBySlug") or {}).get("id")
+            if not event_id:
+                logger.info(
+                    "GraphQL API: could not resolve event ID; "
+                    "using Playwright fallback."
+                )
+                return []
+
+            logger.info(
+                f"GraphQL API: resolved event_id={event_id!r}; "
+                "paginating exhibitors…"
+            )
+
+            # Step 2: Paginate through all exhibitors
+            links: list[dict] = []
+            seen: set[str] = set()
+            cursor: "str | None" = None
+
+            while True:
+                variables = {"eventId": event_id, "first": 100, "after": cursor}
+                query = {"query": EXHIBITOR_LIST_QUERY, "variables": variables}
+                r = await client.post(
+                    config.GRAPHQL_URL, json=query, headers=headers
+                )
+                body = r.json()
+
+                nodes, has_next, cursor = _parse_planning_page(body)
+                for node in nodes:
+                    eid = node.get("id", "")
+                    if not eid:
+                        # Try exhibitor sub-object
+                        eid = (node.get("exhibitor") or {}).get("id", "")
+                    if eid and eid not in seen:
+                        seen.add(eid)
+                        slug = base64.b64encode(eid.encode()).decode()
+                        url = config.EXHIBITOR_DETAIL_BASE + slug
+                        links.append({
+                            "url": url,
+                            "slug": slug,
+                            "booth_id": None,
+                            "_raw_id": eid,
+                        })
+
+                if not has_next or not cursor:
+                    break
+
+            logger.info(f"GraphQL API: discovered {len(links)} exhibitors.")
+            return links
+
+    except Exception as exc:
+        logger.info(
+            f"GraphQL API direct call failed ({exc}); using Playwright fallback."
+        )
+        return []
 
 
 # ── Argument parsing ───────────────────────────────────────────────────────────
@@ -84,6 +193,16 @@ async def discover_exhibitor_links(
     all_links: list[dict] = []
     all_keys: set[str] = set()
     ajax_slugs: list[str] = []       # collected via AJAX/JSON interception
+
+    # ── Step 0: Try direct Swapcard GraphQL API (no browser needed) ───────────
+    api_links = await _try_graphql_api()
+    if api_links:
+        logger.info(
+            f"GraphQL API returned {len(api_links)} links — "
+            "skipping Playwright discovery."
+        )
+        links_cache.set(api_links)
+        return api_links
 
     # ── Intercept ALL JSON responses throughout Phase 1 ────────────────────────
     async def handle_response(response):
@@ -130,13 +249,24 @@ async def discover_exhibitor_links(
 
     # ── Step 2: If we still have few/no links, use Swapcard widget ────────────
     if len(all_links) < 10:
-        logger.info(
-            f"Few links from expowest.com ({len(all_links)}); "
-            f"falling back to Swapcard event widget: {config.EVENT_WIDGET_URL}"
-        )
-        ok = await safe_navigate(page, config.EVENT_WIDGET_URL)
+        # Try the exhibitor-list URL first (plural "exhibitors"), then event home
+        swapcard_urls = [
+            config.EXHIBITOR_LIST_WIDGET_URL,
+            config.EVENT_WIDGET_URL,
+        ]
+        ok = False
+        used_swapcard_url = None
+        for sw_url in swapcard_urls:
+            logger.info(
+                f"Few links from expowest.com ({len(all_links)}); "
+                f"trying Swapcard widget: {sw_url}"
+            )
+            ok = await safe_navigate(page, sw_url)
+            if ok:
+                used_swapcard_url = sw_url
+                break
         if not ok:
-            logger.error("Could not load Swapcard event widget. Aborting Phase 1.")
+            logger.error("Could not load any Swapcard widget URL. Aborting Phase 1.")
             return []
 
         cards_found = await wait_for_exhibitor_cards(page)
@@ -337,103 +467,105 @@ async def _scrape_one_exhibitor(page: Page, url: str) -> tuple[dict, list[dict]]
     Retries up to MAX_RETRIES on failure.
     """
     last_exc = None
-    for attempt in range(1, config.MAX_RETRIES + 1):
+
+    # ── Set up GraphQL interception ONCE, outside the retry loop ──────────────
+    graphql_responses: list[dict] = []
+
+    async def capture_graphql(response):
         try:
-            # ── Set up GraphQL interception BEFORE navigating ──────────────────
-            graphql_responses: list[dict] = []
+            ct = response.headers.get("content-type", "")
+            if "json" in ct:
+                body = await response.json()
+                if isinstance(body, dict) and "data" in body:
+                    graphql_responses.append(body)
+        except Exception:
+            pass
 
-            async def capture_graphql(response):
-                try:
-                    ct = response.headers.get("content-type", "")
-                    if "json" in ct:
-                        body = await response.json()
-                        if isinstance(body, dict) and "data" in body:
-                            graphql_responses.append(body)
-                except Exception:
-                    pass
+    page.on("response", capture_graphql)
+    try:
+        for attempt in range(1, config.MAX_RETRIES + 1):
+            graphql_responses.clear()   # reset for each attempt
+            try:
+                ok = await safe_navigate(page, url)
+                if not ok:
+                    raise RuntimeError(f"Navigation failed for {url}")
 
-            page.on("response", capture_graphql)
+                # Wait for Swapcard React app to finish its initial data fetch
+                await wait_for_network_idle(page)
+                await asyncio.sleep(2)
 
-            ok = await safe_navigate(page, url)
-            if not ok:
-                raise RuntimeError(f"Navigation failed for {url}")
+                # ── Attempt 1: GraphQL JSON ────────────────────────────────────
+                record: dict | None = None
+                team_members: list[dict] = []
 
-            # Wait for Swapcard React app to finish its initial data fetch
-            await wait_for_network_idle(page)
-            await asyncio.sleep(2)
-
-            # ── Attempt 1: GraphQL JSON ────────────────────────────────────────
-            record: dict | None = None
-            team_members: list[dict] = []
-
-            exhibitor_name = ""
-            for body in graphql_responses:
-                r = extractors.parse_graphql_exhibitor(body, url)
-                if r and r.get("exhibitor_name"):
-                    record = r
-                    exhibitor_name = r["exhibitor_name"]
-                    # Also try extracting team members from same response
-                    tm = extractors.parse_graphql_team_members(body, exhibitor_name)
-                    if tm:
-                        team_members = tm
-                    break
-
-            # ── Attempt 2: Embedded <script> JSON ─────────────────────────────
-            if not record or not record.get("exhibitor_name"):
-                html = await page.content()
-                for embedded in extractors.extract_embedded_json(html):
-                    r = extractors.parse_graphql_exhibitor(embedded, url)
+                exhibitor_name = ""
+                for body in graphql_responses:
+                    r = extractors.parse_graphql_exhibitor(body, url)
                     if r and r.get("exhibitor_name"):
                         record = r
                         exhibitor_name = r["exhibitor_name"]
+                        # Also try extracting team members from same response
+                        tm = extractors.parse_graphql_team_members(
+                            body, exhibitor_name
+                        )
+                        if tm:
+                            team_members = tm
                         break
 
-            # ── Attempt 3: HTML parsing ────────────────────────────────────────
-            if not record or not record.get("exhibitor_name"):
-                html = await page.content()
-                record = extractors.extract_exhibitor_detail(html, url)
-                exhibitor_name = record.get("exhibitor_name", "")
+                # ── Attempt 2: Embedded <script> JSON ─────────────────────────
+                if not record or not record.get("exhibitor_name"):
+                    html = await page.content()
+                    for embedded in extractors.extract_embedded_json(html):
+                        r = extractors.parse_graphql_exhibitor(embedded, url)
+                        if r and r.get("exhibitor_name"):
+                            record = r
+                            exhibitor_name = r["exhibitor_name"]
+                            break
 
-            # ── Team members: click team tab, then HTML or GraphQL ─────────────
-            if not team_members:
-                team_html = await _get_team_tab_html(page)
-                # Check for any new GraphQL responses triggered by tab click
-                for body in graphql_responses:
-                    tm = extractors.parse_graphql_team_members(body, exhibitor_name)
-                    if tm:
-                        team_members = tm
-                        break
-                # Fall back to HTML
+                # ── Attempt 3: HTML parsing ────────────────────────────────────
+                if not record or not record.get("exhibitor_name"):
+                    html = await page.content()
+                    record = extractors.extract_exhibitor_detail(html, url)
+                    exhibitor_name = record.get("exhibitor_name", "")
+
+                # ── Team members: click team tab, then HTML or GraphQL ─────────
                 if not team_members:
-                    team_members = extractors.extract_team_members(
-                        team_html, exhibitor_name
+                    team_html = await _get_team_tab_html(page)
+                    # Check for any new GraphQL responses triggered by tab click
+                    for body in graphql_responses:
+                        tm = extractors.parse_graphql_team_members(
+                            body, exhibitor_name
+                        )
+                        if tm:
+                            team_members = tm
+                            break
+                    # Fall back to HTML
+                    if not team_members:
+                        team_members = extractors.extract_team_members(
+                            team_html, exhibitor_name
+                        )
+
+                return record, team_members
+
+            except Exception as exc:
+                last_exc = exc
+                if attempt < config.MAX_RETRIES:
+                    wait = config.RETRY_BASE_WAIT_SECONDS * (2 ** (attempt - 1))
+                    logger.warning(
+                        f"Attempt {attempt} failed for {url}: {exc}. "
+                        f"Retrying in {wait:.0f}s…"
                     )
+                    await asyncio.sleep(wait)
 
-            # Remove response listener before next navigation
-            try:
-                page.remove_listener("response", capture_graphql)
-            except Exception:
-                pass
+        raise RuntimeError(
+            f"All {config.MAX_RETRIES} attempts failed for {url}"
+        ) from last_exc
 
-            return record, team_members
-
-        except Exception as exc:
-            last_exc = exc
-            try:
-                page.remove_listener("response", capture_graphql)
-            except Exception:
-                pass
-            if attempt < config.MAX_RETRIES:
-                wait = config.RETRY_BASE_WAIT_SECONDS * (2 ** (attempt - 1))
-                logger.warning(
-                    f"Attempt {attempt} failed for {url}: {exc}. "
-                    f"Retrying in {wait:.0f}s…"
-                )
-                await asyncio.sleep(wait)
-
-    raise RuntimeError(
-        f"All {config.MAX_RETRIES} attempts failed for {url}"
-    ) from last_exc
+    finally:
+        try:
+            page.remove_listener("response", capture_graphql)
+        except Exception:
+            pass
 
 
 # ── Phase 3: Write output ──────────────────────────────────────────────────────
@@ -491,6 +623,10 @@ async def main() -> int:
     scraped_cache = ScrapedCache()
     team_cache   = TeamMembersCache()
     progress     = ProgressTracker()
+
+    # Always write empty output files up front so the artifact upload step
+    # finds *something* even if the scraper fails before writing any data.
+    _safe_write_outputs([], [])
 
     async with async_playwright() as playwright:
         browser, context = await create_browser_context(playwright, headless=headless)

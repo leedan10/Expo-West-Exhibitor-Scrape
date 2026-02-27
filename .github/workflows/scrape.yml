@@ -3,6 +3,10 @@ name: Expo West 2026 Exhibitor Scraper
 on:
   workflow_dispatch:
     inputs:
+      branch:
+        description: "Branch to run scraper from"
+        required: false
+        default: "claude/fix-web-scraper-MiD8x"
       limit:
         description: "Max exhibitors to scrape (0 = all)"
         required: false
@@ -22,6 +26,8 @@ jobs:
       # ── 1. Checkout repo ─────────────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref_name }}
 
       # ── 2. Python setup ───────────────────────────────────────────────────────
       - name: Set up Python 3.11

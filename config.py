@@ -35,7 +35,10 @@ EVENT_SLUG = "natural-products-expo-west-2026"
 # Base URL for individual exhibitor detail pages
 EXHIBITOR_DETAIL_BASE = f"{BASE_URL}/widget/event/{EVENT_SLUG}/exhibitor/"
 
-# Fallback: Swapcard event widget listing (used when expowest.com has no links)
+# Fallback: Swapcard event widget exhibitor list (plural "exhibitors")
+EXHIBITOR_LIST_WIDGET_URL = f"{BASE_URL}/widget/event/{EVENT_SLUG}/exhibitors"
+
+# Fallback: Swapcard event widget home (used as last resort)
 EVENT_WIDGET_URL = f"{BASE_URL}/widget/event/{EVENT_SLUG}"
 
 # Swapcard GraphQL endpoint (the widget calls this; we intercept the response)
