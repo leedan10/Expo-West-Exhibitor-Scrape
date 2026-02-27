@@ -135,6 +135,18 @@ SOCIAL_DOMAINS = {
     "linkedin.com",
     "instagram.com",
     "youtube.com",
+    "youtu.be",
     "tiktok.com",
     "pinterest.com",
+}
+
+# Per-platform domain mapping (used by extractors to assign the right column)
+SOCIAL_PLATFORM_DOMAINS: dict[str, list[str]] = {
+    "facebook":  ["facebook.com"],
+    "twitter":   ["twitter.com", "x.com"],
+    "linkedin":  ["linkedin.com"],
+    "instagram": ["instagram.com"],
+    "youtube":   ["youtube.com", "youtu.be"],
+    "tiktok":    ["tiktok.com"],
+    "pinterest": ["pinterest.com"],
 }
